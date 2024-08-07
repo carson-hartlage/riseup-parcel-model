@@ -1,0 +1,703 @@
+---
+title: "RISEUP ED/UC Parcel modeling"
+#author: "Carson Hartlage, adapted from Qing Duan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+        toc: true
+        toc_float: 
+            collapsed: false
+            smooth_scroll: true
+        code_download: true
+        code_folding: hide
+        highlight: pygments
+        df_print: kable
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(gtsummary)
+library(pROC)
+library(parsnip)
+library(grf)
+library(rpart.plot)
+library(sf)
+library(tmap)
+library(rpart)
+#library(cowplot)
+library(caret)
+library(purrr)
+library(dplyr)
+library(reshape2)
+```
+
+# Updates
+<!-- * 6/10/24: -->
+<!--   + eliminated some census tract factors (that are covered by parcel data - conditions, before 1970, median home value) for combined neighborhood+parcel model -->
+<!--   + added number of births as a parcel factor -->
+<!--   + added CART model to compare to GRF -->
+<!-- * 6/11/24: -->
+<!--   + weighted birth data -->
+<!-- * 6/13/24: -->
+<!--   + added CART fitting, var imp, and tree plots -->
+<!-- * 6/14/24: -->
+<!--   + ran with binary any birth variable instead of weighted births -->
+<!-- * 6/18/24: -->
+<!--   + raw number of births -->
+<!--   + got rid of GRF modeling -->
+<!--   + deaggregated apartments into 3 types -->
+<!--   + input data now includes crime and is filtered for City of Cincinnati -->
+<!--   + changed sampling method for folds (stratified, no longer under-sampled) due to unbalanced data -->
+<!-- * 6/20/24 -->
+<!--   + got rid of neighborhood model -->
+<!--   + changed mean absolute error to median, added median abs % error -->
+<!-- * 6/28/24 -->
+<!--   + got rid of parcel model -->
+<!--   + brought GRF back -->
+<!--   + filtered out MHA -->
+<!--   + fit model to land use subsets (single family, 2-3 family, apartments) -->
+<!-- * 7/10/24 -->
+<!--   + removed births as a predictor -->
+<!--   + made outcome variable abs(visits - births) -->
+<!--   + added is.sfh as a predictor -->
+<!--   + added scatter plots of actual vs. predicted -->
+<!-- * 7/11/24 -->
+<!--   + made outcome variable: visits - births -->
+<!--   + got rid of land use models, abs percent error -->
+<!-- * 7/15/24 -->
+<!--   + updating for new data -->
+<!-- * 7/16/24 -->
+<!--   + realistic MTV adjustment (?) -->
+<!--   + made year built a binary variable (before/after 1970) -->
+* 7/18/24
+  + predicting on GRF only
+  + added total crime and is.condo as predictors
+* 7/19/24
+  + AUC and sensitivity/specificity
+* 8/1/24
+  + replace census tract crime with parcel 200m-buffered crime
+* 8/6/24
+  + replace total crime with non-violent crime (other + property)
+
+# Prep
+```{r}
+variable_parcel_lvl <- c("market_total_value_10k", "is.sfh", "is.2or3FamHome", "is.apt4.19", "is.apt20.39", "is.apt40", "is.condo", "n_violation", "n_paint_violation", "year_built", "violent_crime_parcel", "nv_crime_parcel")
+
+variable_ct_lvl_2 <- c("fraction_assisted_income", "fraction_high_school_edu", "fraction_no_health_ins", "fraction_vacant_housing", "fraction_owner_occupied", "fraction_poverty", "median_income", "median_rent_to_income_percentage", 
+"fraction_employment", "n_children_lt18_per_hh", "fraction_household_lt18", "fraction_crowding", "population_density", "fraction_fam_nospouse", "fraction_lesh")
+```
+
+```{r}
+d <- readRDS("~/Desktop/PhD/RISEUP_parcels/data/data_for_analysis_20240806.rds") |>
+  select(-cagis_addr)
+
+d <- d |>
+  mutate(
+    n_births = if_else(is.na(n_births), 0, n_births),
+    acreage = na_if(acreage, 0),
+    violent_crime_parcel = if_else(is.na(violent_crime_parcel), 0, 
+                                   violent_crime_parcel),
+    nv_crime_parcel = if_else(is.na(nv_crime_parcel), 0, nv_crime_parcel),
+    #violent_crime_ct = if_else(is.na(violent_crime_ct), 0, violent_crime_ct),
+    #total_crime_ct = if_else(is.na(total_crime_ct), 0, total_crime_ct),
+    n_violation = if_else(is.na(n_violation), 0, n_violation),
+    n_paint_violation = if_else(is.na(n_paint_violation), 0, n_paint_violation),
+    is.sfh = (land_use == "single family dwelling"),
+    is.2or3FamHome = (land_use == "two family dwelling" | 
+                        land_use == "three family dwelling"),
+    is.apt4.19 = (land_use == "apartment, 4-19 units"),
+    is.apt20.39 = (land_use == "apartment, 20-39 units"),
+    is.apt40 = (land_use == "apartment, 40+ units"),
+    is.condo = (land_use %in% c("condominium unit", "landominium", "condo or pud garage")),
+    n_visit_minus_birth = n_visit - n_births,
+    any_visit = if_else(n_visit > 0, "Yes", "No"),
+    market_total_value_10k = online_market_total_value / 10000,
+    market_total_value_10k = 
+      if_else(market_total_value_10k < quantile(market_total_value_10k , 0.01) | 
+                market_total_value_10k > quantile(market_total_value_10k, 0.99), 
+                NA, market_total_value_10k)
+  )
+
+d_for_model <- d |> 
+  select(cagis_address, any_visit, n_visit_minus_birth, 
+         all_of(c(variable_ct_lvl_2, variable_parcel_lvl)))
+
+d_for_model$any_visit <- factor(d_for_model$any_visit, levels = c("No", "Yes"))
+
+d_for_model |> count(any_visit)
+
+table(d$land_use)
+#print(sapply(d_for_model, function(x) sum(is.na(x))))
+```
+
+Old parcel data had 71,695 parcels with 113,941 total visits and 22,687 births.
+
+New address data has 77,077 addresses with 137,875 total visits (~20% increase) and 36,228 births (~60% increase).
+
+Ratio of visit:no visit roughly the same (30% have a visit).
+
+# Summary graphs
+```{r, fig.height=10, fig.width=10, eval=FALSE}
+
+hist1 <- ggplot(d_for_model, aes(x = n_visit_minus_birth)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(title = "Histogram of Visits per Address",
+       x = "Number of Visits Minus Number of Births",
+       y = "Frequency")
+
+hist2 <- ggplot(d_for_model, aes(x = market_total_value_10k)) +
+  geom_histogram(binwidth = 5, fill = "blue", color = "black") +
+  geom_vline(xintercept = median(d_for_model$market_total_value_10k, na.rm = TRUE), 
+             color = "red", linetype = "dashed", linewidth = 0.5) +
+  labs(title = "Histogram of MTV",
+       x = "Market Total Value (10k)",
+       y = "Frequency") +
+  xlim(0, 300)
+
+hist3 <- ggplot(d_for_model, aes(x = year_built)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  geom_vline(xintercept = median(d_for_model$year_built, na.rm = TRUE), 
+             color = "red", linetype = "dashed", linewidth = 0.5) +
+  labs(title = "Histogram of Year Built",
+          x = "Year Built",
+          y = "Frequency")
+
+hist4 <- ggplot(d_for_model, aes(x = crime_violent)) +
+  geom_histogram(binwidth = 10, fill = "blue", color = "black") +
+  geom_vline(xintercept = median(d_for_model$crime_violent, na.rm = TRUE), 
+             color = "red", linetype = "dashed", linewidth = 0.5) +
+  labs(title = "Histogram of Violent Crime",
+          x = "Cumulative Violent Crime Incidents per Census Tract",
+          y = "Frequency")
+# 
+gridExtra::grid.arrange(hist1, hist2, hist3, hist4, ncol = 2)
+```
+
+# GRF Fitting
+```{r, eval=F}
+predictors <- c(variable_parcel_lvl, variable_ct_lvl_2)
+
+grf_fit <-
+  regression_forest(
+    X = select(d_for_model, all_of(predictors)),
+    Y = d_for_model$n_visit_minus_birth,
+    seed = 1234,
+    num.threads = parallel::detectCores(),
+    sample.fraction = 0.5,
+    alpha = 0.05,
+    imbalance.penalty = 0,
+    honesty = FALSE,
+    tune.parameters = "none",
+    num.trees = 1000,
+    min.node.size = 5,
+    compute.oob.predictions = FALSE
+  )
+
+save(grf_fit, file = "~/Desktop/PhD/RISEUP_parcels/data/grf_fit.RData")
+```
+
+```{r, eval=FALSE}
+# predict out of bag
+oob_predictions <- predict(grf_fit, estimate.variance = TRUE, out.of.bag = TRUE)
+
+save(oob_predictions, file = "~/Desktop/PhD/RISEUP_parcels/data/oob_predictions.RData")
+
+# calculate variables of importance
+predictors <- c(variable_parcel_lvl, variable_ct_lvl_2)
+var_imp <- variable_importance(grf_fit, decay.exponent = 2, 
+                               max.depth = 4)
+
+save(var_imp, file = "~/Desktop/PhD/RISEUP_parcels/data/var_imp.RData")
+
+
+### lime
+# library(lime)
+# model_type.regression_forest <- function(x, ...) {
+#   return("regression")
+# }
+# 
+# predict_model.regression_forest <- function(model, newdata, ...) {
+#   predictions <- predict(model, newdata)$predictions
+#   return(as.data.frame(predictions))
+# }
+# 
+# explainer_data <- select(d_for_model, all_of(c(variable_ct_lvl_2, variable_parcel_lvl)))
+# 
+# sampled_data <- explainer_data[sample(nrow(explainer_data), 200), ]
+# 
+# explainer <- lime::lime(explainer_data, grf_fit)
+# 
+# rm(grf_fit)
+# 
+# explanation <- lime::explain(sampled_data, explainer, n_features = 2)
+
+```
+
+# Predict out-of-bag using GRF
+```{r, fig.height=4, fig.width=8}
+#load("~/Desktop/PhD/RISEUP_parcels/data/grf_fit.RData")
+load("~/Desktop/PhD/RISEUP_parcels/data/oob_predictions.RData")
+
+d_for_model <- d_for_model |>
+  mutate(pred_grf_oob = oob_predictions$predictions) |>
+  mutate(pred_grf_oob_variance = oob_predictions$variance.estimates) |>
+  mutate(standard_error = sqrt(pred_grf_oob_variance)) |>
+  mutate(lci = pred_grf_oob - standard_error * qnorm(0.025, lower.tail = FALSE),
+         uci = pred_grf_oob + standard_error * qnorm(0.025, lower.tail = FALSE),
+         ci_width = uci - lci)
+
+plot1 <- ggplot(d_for_model, aes(x = pred_grf_oob, y = standard_error)) +
+  geom_point(size = 0.5, alpha = 0.6) +
+  labs(x = "Predicted Visits (minus Births)",
+       y = "OOB Standard Error") +
+  xlim(-5, 90) +
+  ylim(0, 60)
+
+plot2 <- ggplot(d_for_model, aes(x = pred_grf_oob, y = ci_width)) +
+  geom_point(size = 0.5, alpha = 0.6) +
+  labs(x = "Predicted Visits (minus Births)",
+       y = "Width of 95% CI") +
+  xlim(-5, 90) +
+  ylim(0, 250)
+```
+
+## Variables of Importance
+```{r}
+# prediction
+load("~/Desktop/PhD/RISEUP_parcels/data/var_imp.RData")
+
+predictors <- c(variable_parcel_lvl, variable_ct_lvl_2)
+var_imp <- data.frame(predictor = predictors, var_imp = var_imp*100) |>
+  arrange(desc(var_imp))
+
+var_imp <- var_imp |>
+  mutate(category = case_when(
+    predictor %in% variable_parcel_lvl ~ "parcel",
+    predictor %in% variable_ct_lvl_2 ~ "census tract"
+  )) |>
+  arrange(var_imp)
+
+var_imp$predictor <- factor(var_imp$predictor, levels = unique(var_imp$predictor))
+
+ggplot(var_imp, aes(x = predictor, y = var_imp, fill = category)) +
+  geom_col() +
+  labs(x = "Predictors",
+       y = "Importance") + 
+  coord_flip() +
+  theme(
+    axis.text = element_text(size = 10), 
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 12)
+  )
+
+```
+
+```{r, eval=FALSE}
+saveRDS(var_imp, "~/Desktop/PhD/RISEUP_parcels/data/var_imp.rds")
+```
+
+# Predict in-bag (new data) using GRF
+```{r, eval=FALSE}
+# prediction
+#load("~/Desktop/PhD/RISEUP_parcels/data/grf_fit.RData")
+#predictors <- c(variable_parcel_lvl, variable_ct_lvl_2)
+
+#d_for_model$pred_grf_ib <- predict(grf_fit, newdata = dplyr::select(d_for_model, all_of(predictors)))$predictions
+
+pred_grf_ib <- predict(grf_fit, newdata = dplyr::select(d_for_model, all_of(predictors)))$predictions
+
+save(pred_grf_ib, file = "~/Desktop/PhD/RISEUP_parcels/data/pred_grf_ib.RData")
+
+```
+
+```{r, eval = FALSE}
+d_for_model$pred_grf_ib <- pred_grf_ib
+
+d2 <- left_join(d_for_model, d)
+# export data for shiny app
+saveRDS(d2, 
+        "~/Desktop/PhD/RISEUP_parcels/data/data_for_shiny_20240807.rds")
+```
+
+# Calibration
+
+## Plots
+```{r, fig.height=5, fig.width=10}
+load("~/Desktop/PhD/RISEUP_parcels/data/pred_grf_ib.RData") 
+
+d_for_model$pred_grf_ib <- pred_grf_ib
+
+spearman_corr <- cor(d_for_model$n_visit_minus_birth, d_for_model$pred_grf_ib, method = "spearman")
+
+plot1 <- ggplot(data = d_for_model, aes(x = n_visit_minus_birth, y = pred_grf_ib)) +
+  geom_jitter(size = 0.5, alpha = 0.3) +
+  labs(title = "Scatter Plot of Actual vs. Predicted, Pseudo Log Scale",
+       x = "Actual Visits (Minus Births)",
+       y = "Predicted Visits (Minus Births)") +
+  geom_abline(slope = 1, intercept = 0, color = "orange", linetype = "solid") +
+  geom_vline(xintercept = quantile(d_for_model$n_visit_minus_birth, 0.95), 
+             color = "blue", linetype = "dashed") +
+  geom_hline(yintercept = quantile(d_for_model$pred_grf_ib, 0.95), 
+             color = "blue", linetype = "dashed") + 
+  scale_x_continuous(trans=scales::pseudo_log_trans(base = 10)) +
+  scale_y_continuous(trans=scales::pseudo_log_trans(base = 10)) +
+  annotate("text", x = 80, y = 95, label = paste("Correlation:", 
+             round(spearman_corr, 3)), size = 4, color = "black")
+
+
+
+
+plot2 <- ggplot(data = d_for_model, aes(x = n_visit_minus_birth, y = pred_grf_ib)) +
+  labs(title = "Hex Density Plot of Actual vs. Predicted, Pseudo Log Scale",
+       x = "Actual Visits (Minus Births)",
+       y = "Predicted Visits (Minus Births)") +
+  geom_hex(bins = 100) +
+  #geom_density_2d_filled() +
+  scale_fill_gradientn(
+    colors = viridis::viridis(5),
+    values = scales::rescale(c(0, 10, 50, 100, 12000)),
+    limits = c(0, 12000)
+  ) +
+  geom_abline(slope = 1, intercept = 0, color = "black", linetype = 
+                "solid") +
+  # geom_vline(xintercept = quantile(d_for_model$n_visit_minus_birth, 
+  #               0.95), color = "blue", linetype = "dashed") +
+  # geom_hline(yintercept = quantile(d_for_model$pred_grf_ib, 0.95), 
+  #               color = "blue", linetype = "dashed") +
+  theme_bw() +
+  scale_x_continuous(trans=scales::pseudo_log_trans(base = 10)) +
+  scale_y_continuous(trans=scales::pseudo_log_trans(base = 10)) +
+  annotate("text", x = 80, y = 95, label = paste("Correlation:",
+                  round(spearman_corr, 3)), size = 4, color = "black") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+
+gridExtra::grid.arrange(plot1, plot2, ncol = 2)
+
+
+ggplot(d_for_model, aes(x = pred_grf_ib)) +
+     geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+     labs(title = "Histogram of Predicted Visits per Address",
+          x = "Number of Visits Minus Number of Births",
+          y = "Frequency") + scale_y_log10()
+```
+Pseudo-log Transformation: signed logarithm for large absolute values, and transitions smoothly to zero as the underlying values approach zero
+
+```{r, fig.height=5, fig.width=10, eval=FALSE}
+ggplot(d_for_model, aes(x = pred_grf_ib)) +
+     geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+     labs(title = "Histogram of Predicted Visits per Address",
+          x = "Number of Visits Minus Number of Births",
+          y = "Frequency") + scale_y_log10() +
+  geom_vline(xintercept = quantile(pred_grf_ib, 0.95)) +
+  theme_minimal()
+```
+
+# Performance Stats
+```{r}
+d_for_model <- d_for_model |>
+  mutate(
+    above_95th_actual = ifelse(n_visit_minus_birth > 
+                  quantile(d_for_model$n_visit_minus_birth, 0.95), TRUE, FALSE),
+    above_95th_pred = ifelse(pred_grf_ib > 
+                  quantile(d_for_model$pred_grf_ib, 0.95), TRUE, FALSE),
+    above_90th_actual = ifelse(n_visit_minus_birth > 
+                  quantile(d_for_model$n_visit_minus_birth, 0.90), TRUE, FALSE),
+    above_90th_pred = ifelse(pred_grf_ib > 
+                  quantile(d_for_model$pred_grf_ib, 0.90), TRUE, FALSE),
+    above_85th_actual = ifelse(n_visit_minus_birth > 
+                  quantile(d_for_model$n_visit_minus_birth, 0.85), TRUE, FALSE),
+    above_85th_pred = ifelse(pred_grf_ib > 
+                  quantile(d_for_model$pred_grf_ib, 0.85), TRUE, FALSE),
+    above_75th_actual = ifelse(n_visit_minus_birth > 
+                  quantile(d_for_model$n_visit_minus_birth, 0.75), TRUE, FALSE),
+    above_75th_pred = ifelse(pred_grf_ib > 
+                  quantile(d_for_model$pred_grf_ib, 0.75), TRUE, FALSE)
+  )
+```
+
+```{r function}
+get_roc <- function(observed, predicted){
+  # roc
+  roc_m <- pROC::roc(response = observed,
+                predictor= predicted,
+                percent = TRUE, ci=TRUE, ci.alpha=0.95)
+
+  sp_se_m <- pROC::coords(roc_m, "best", best.method="youden") |> round(digits=1)
+
+  lst <- list(roc = roc_m,
+              sp_se = sp_se_m)
+
+  return(lst)
+}
+```
+
+```{r}
+roc_95 <- get_roc(as.numeric(d_for_model$above_95th_actual), 
+                  as.numeric(d_for_model$above_95th_pred))
+roc_90 <- get_roc(as.numeric(d_for_model$above_90th_actual), 
+                  as.numeric(d_for_model$above_90th_pred))
+roc_85 <- get_roc(as.numeric(d_for_model$above_85th_actual), 
+                  as.numeric(d_for_model$above_85th_pred))
+roc_75 <- get_roc(as.numeric(d_for_model$above_75th_actual), 
+                  as.numeric(d_for_model$above_75th_pred))
+```
+
+## AUC
+```{r roc-plot, fig.height=10, fig.width=10}
+plot(roc_95$roc, print.auc=TRUE,
+     print.auc.adj = c(0, 1),
+     col="blue")
+plot(roc_90$roc, print.auc=TRUE, add=TRUE,
+     print.auc.adj = c(0, 3),
+     col="darkblue")
+plot(roc_85$roc, print.auc=TRUE, add=TRUE,
+     print.auc.adj = c(0, 5),
+     col="purple2")
+plot(roc_75$roc, print.auc=TRUE, add=TRUE,
+     print.auc.adj = c(0, 7),
+     col="darkgreen")
+
+legend("bottomright",
+       legend=c("Top 5%",
+                "Top 10%",
+                "Top 15%",
+                "Top 25%"),
+       col=c("blue", "darkblue", "purple2", "darkgreen"),
+       lwd=2)
+
+# roc tests
+# roc.test(roc_95$roc, roc_90$roc)
+# roc.test(roc_90$roc, roc_85$roc)
+# roc.test(roc_85$roc, roc_95$roc)
+
+```
+
+## Sensitivity and Specificity
+```{r comparison, fig.height=2, fig.width=8}
+# auc / specificity / sensitivity
+sp_se <- rbind(roc_95$sp_se,
+               roc_90$sp_se,
+               roc_85$sp_se,
+               roc_75$sp_se)
+
+tab <- tibble(Threshold = c("Top 5%",
+                            "Top 10%",
+                            "Top 15%",
+                            "Top 20%"),
+               pct_AUC = round(c(ci.auc(roc_95$roc)[2],
+                                 ci.auc(roc_90$roc)[2],
+                                 ci.auc(roc_85$roc)[2],
+                                 ci.auc(roc_75$roc)[2]),
+                                digits=1),
+               lower_ci = round(c(ci.auc(roc_95$roc)[1],
+                                  ci.auc(roc_90$roc)[1],
+                                  ci.auc(roc_85$roc)[1],
+                                  ci.auc(roc_75$roc)[1]),
+                                digits=1),
+               upper_ci = round(c(ci.auc(roc_95$roc)[3],
+                                  ci.auc(roc_90$roc)[3],
+                                  ci.auc(roc_85$roc)[3],
+                                  ci.auc(roc_75$roc)[3]),
+                                digits=1),
+               sp_se) |>
+  rename(Specificity = specificity,
+         Sensitivity = sensitivity) |>
+  mutate(`%AUC (95% CI)` = sprintf("%.1f (%.1f-%.1f)", pct_AUC, lower_ci, upper_ci),
+         ` ` = paste(rep(" ", 20), collapse = " "))
+
+# forest plot
+p <- forestploter::forest(tab[,c(1,6:7,9,8)],
+            est = tab$pct_AUC,
+            lower = tab$lower_ci,
+            upper = tab$upper_ci,
+            ci_column = 4,
+            xlim = c(80, 87))
+plot(p)
+
+# ggsave(file="output/forestPlot.svg", plot=p, width=10, height=8)
+```
+
+### By Property Type and Threshold
+```{r}
+calculate_metrics <- function(data) {
+  percentiles <- c("95th", "90th", "85th", "75th")
+  metrics_list <- lapply(percentiles, function(p) {
+    actual <- data[[paste0("above_", p, "_actual")]]
+    predicted <- data[[paste0("above_", p, "_pred")]]
+    
+    conf_matrix <- table(actual, predicted)
+    sensitivity_val <- sensitivity(conf_matrix)
+    specificity_val <- specificity(conf_matrix)
+    
+    data.frame(percentile = p, sensitivity = sensitivity_val, specificity = specificity_val)
+  })
+  
+  do.call(rbind, metrics_list)
+}
+
+# Filter data by housing type
+sfh_data <- d_for_model |> filter(is.sfh == TRUE)
+mfh_data <- d_for_model |> filter(is.2or3FamHome == TRUE)
+apt_data <- d_for_model |> filter(is.apt4.19 == TRUE | is.apt20.39 == TRUE | is.apt40 == TRUE)
+condo_data <- d_for_model |> filter(is.condo == TRUE)
+
+# Calculate metrics for each type
+sfh_metrics <- calculate_metrics(sfh_data) |> mutate(type = "Single-family homes")
+mfh_metrics <- calculate_metrics(mfh_data) |> mutate(type = "2-3-family homes")
+apt_metrics <- calculate_metrics(apt_data) |> mutate(type = "Apartments")
+condo_metrics <- calculate_metrics(condo_data) |> mutate(type = "Condos")
+
+# Combine all results into one data frame
+combined_metrics <- bind_rows(sfh_metrics, mfh_metrics, apt_metrics, condo_metrics)
+
+```
+
+```{r, fig.height=5, fig.width=10}
+metrics_long <- combined_metrics %>%
+  pivot_longer(cols = c("sensitivity", "specificity"), 
+               names_to = "metric", 
+               values_to = "value") %>%
+  mutate(value = value * 100,
+         type = factor(type, levels = c("Single-family homes", "2-3-family homes", "Apartments", "Condos")))
+
+sensitivity_plot <- ggplot(metrics_long %>% filter(metric == "sensitivity"), 
+                           aes(x = percentile, y = value, fill = type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), color = "black", width = 0.7) +
+  labs(title = "Sensitivity by Housing Type and Percentile",
+       x = "Percentile",
+       y = "Sensitivity (%)",
+       fill = "Property Type") +
+  theme(plot.title = element_text(size=12)) +
+  scale_y_continuous(limits = c(0, 100),
+                     breaks=c(0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100))
+
+specificity_plot <- ggplot(metrics_long %>% filter(metric == "specificity"), 
+                           aes(x = percentile, y = value, fill = type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), color = "black", width = 0.7) +
+  labs(title = "Specificity by Housing Type and Percentile",
+       x = "Percentile",
+       y = "Specificity (%)",
+       fill = "Property Type") +
+  theme(plot.title = element_text(size=12)) +
+  scale_y_continuous(limits = c(0, 100),
+                     breaks=c(0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100))
+
+gridExtra::grid.arrange(sensitivity_plot, specificity_plot, ncol = 2)
+```
+
+```{r, fig.height=5, fig.width=10, eval=FALSE}
+
+hist1 <- ggplot(d_for_model, aes(x = n_visit_minus_birth)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(title = "Histogram of Actual Visits per Address",
+       x = "Number of Visits Minus Number of Births",
+       y = "Frequency") +
+  xlim(-10, 80) +
+  ylim(-10, 50000)
+
+hist2 <- ggplot(d_for_model, aes(x = pred_grf_ib)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(title = "Histogram of Predictions per Address",
+       x = "Predicted Number of Visits Minus Number of Births",
+       y = "Frequency") +
+  xlim(-10, 80) +
+  ylim(-10, 50000)
+
+gridExtra::grid.arrange(hist1, hist2, ncol = 2)
+```
+
+# Tree fit on GRF 
+Fit a CART to predicted values
+```{r, fig.height=10, fig.width=12}
+
+set.seed(1234)
+
+cart_mod <-
+  decision_tree(cost_complexity=0, min_n = 400) |>  # no cost, default is 0.01
+  set_engine("rpart") |>
+  set_mode("regression") |>
+  translate()
+
+#paste(c(variable_parcel_lvl, variable_ct_lvl_2), collapse = " + ")
+cart_grf_fit <- cart_mod |>
+  fit(pred_grf_ib ~ market_total_value_10k + is.sfh + is.2or3FamHome + is.apt4.19 + is.apt20.39 + is.apt40 + is.condo + n_violation + n_paint_violation + year_built + violent_crime_parcel + nv_crime_parcel + fraction_assisted_income + fraction_high_school_edu + fraction_no_health_ins + fraction_vacant_housing + fraction_owner_occupied + fraction_poverty + median_income + median_rent_to_income_percentage + fraction_employment + n_children_lt18_per_hh + fraction_household_lt18 + fraction_crowding + population_density + fraction_fam_nospouse + fraction_lesh,
+      data = d_for_model)
+
+xerrors <- cart_grf_fit$fit$cptable |> as_tibble()
+#xerrors |> print(n=20)
+#
+nsplits_plot <- xerrors[1:20,] |>
+    ggplot(aes(nsplit, xerror, ymin = xerror - xstd, ymax = xerror + xstd)) +
+    geom_pointrange() +
+    scale_x_continuous(breaks = seq(0, 10, 2)) +
+    theme_minimal() +
+    labs(x = 'Number of Splits', y = 'Cross-Validated Error')
+#nsplits_plot
+
+# split within the upper bound of min error
+#(min_xerror <- xerrors |> pull(xerror) |> min())
+
+#n <- xerrors |> filter(nsplit <=15) |> pull(nsplit) |> max() #splits <= 15 for visualization
+
+cart_grf_pruned <- rpart::prune(cart_grf_fit$fit, cp = cart_grf_fit$fit$cptable[which(cart_grf_fit$fit$cptable[,'nsplit'] == which.min(abs(cart_grf_fit$fit$cptable[, 'nsplit'] - 12))),"CP"])
+
+#save(cart_grf_pruned, file = "~/Desktop/PhD/RISEUP_parcels/data/cart_grf_fit.RData")
+
+# ### plot
+prp(cart_grf_pruned, cex = 0.8, extra = 1, roundint=FALSE, varlen=10)
+# 
+var_importance <- cart_grf_pruned$variable.importance
+scaled_importance <- var_importance / sum(var_importance)
+#print(scaled_importance)
+```
+
+# CART
+```{r, fig.height=10, fig.width=12}
+
+set.seed(1234)
+
+cart_mod <- 
+  decision_tree(cost_complexity=0, min_n=400) |>  # no cost, default is 0.01
+  set_engine("rpart") |> 
+  set_mode("regression") |> 
+  translate()
+
+#paste(c(variable_ct_lvl_2, variable_parcel_lvl), collapse = " + ")
+cart_fit_np <- cart_mod |> 
+  fit(n_visit_minus_birth ~ market_total_value_10k + is.sfh + is.2or3FamHome + is.apt4.19 + is.apt20.39 + is.apt40 + is.condo + n_violation + n_paint_violation + year_built + violent_crime_parcel + nv_crime_parcel + fraction_assisted_income + fraction_high_school_edu + fraction_no_health_ins + fraction_vacant_housing + fraction_owner_occupied + fraction_poverty + median_income + median_rent_to_income_percentage + fraction_employment + n_children_lt18_per_hh + fraction_household_lt18 + fraction_crowding + population_density + fraction_fam_nospouse + fraction_lesh, 
+      data = d_for_model)
+
+#xerrors <- cart_fit_np$fit$cptable |> as_tibble()
+#xerrors |> print(n=20)
+
+# nsplits_plot <- xerrors[1:20,] |>
+#     ggplot(aes(nsplit, xerror, ymin = xerror - xstd, ymax = xerror + xstd)) +
+#     geom_pointrange() +
+#     scale_x_continuous(breaks = seq(0, 10, 2)) +
+#     theme_minimal() +
+#     labs(x = 'Number of Splits', y = 'Cross-Validated Error')
+#nsplits_plot
+
+
+# split within the upper bound of min error
+#(min_xerror <- xerrors |> pull(xerror) |> min())
+
+#n <- xerrors |> filter(nsplit <=15) |> pull(nsplit) |> max() #splits <= 15 for visualization
+
+cart_pruned_np <- rpart::prune(cart_fit_np$fit, cp = cart_fit_np$fit$cptable[which(cart_fit_np$fit$cptable[,'nsplit'] == which.min(abs(cart_fit_np$fit$cptable[, 'nsplit'] - 15))),"CP"])
+
+#save(cart_pruned_np, file = "~/Desktop/PhD/RISEUP_parcels/data/cart_fit_np.RData")
+
+# ### plot
+prp(cart_pruned_np, cex = 0.8, extra = 1, roundint=FALSE, varlen=10)
+# 
+#var_importance <- cart_pruned_np$variable.importance
+#scaled_importance_np <- var_importance / sum(var_importance)
+#print(scaled_importance_np)
+
+```
